@@ -2,7 +2,7 @@
 
 # Tiny Tapeout Verilog Project Template
 
-- [Read the documentation for project](docs/info.md)
+clone of Uri Shaked 2048
 
 ## What is Tiny Tapeout?
 
