@@ -1,11 +1,11 @@
 /*
- * Copyright (c) 2024 Your Name
+ * Copyright (c) 2024 Uri Shaked
  * SPDX-License-Identifier: Apache-2.0
  */
 
 `default_nettype none
 
-module tt_um_example (
+module tt_um_2048_vga_game (
     input  wire [7:0] ui_in,    // Dedicated inputs
     output wire [7:0] uo_out,   // Dedicated outputs
     input  wire [7:0] uio_in,   // IOs: Input path
@@ -16,12 +16,281 @@ module tt_um_example (
     input  wire       rst_n     // reset_n - low to reset
 );
 
-  // All output pins must be assigned. If not used, assign to 0.
-  assign uo_out  = ui_in + uio_in;  // Example: ou_out is the sum of ui_in and uio_in
-  assign uio_out = 0;
-  assign uio_oe  = 0;
+  // Direct inputs
+  wire btn_up_in;
+  wire btn_down_in;
+  wire btn_left_in;
+  wire btn_right_in;
+  wire retro_colors_in = ui_in[4] & ui_in[5];
+  wire debug_en = ui_in[7];
 
-  // List all unused inputs to prevent warnings
-  wire _unused = &{ena, clk, rst_n, 1'b0};
+  button_debounce btn_up_debounce (
+      .clk(clk),
+      .rst_n(rst_n),
+      .button(ui_in[0]),
+      .debounced(btn_up_in)
+  );
+
+  button_debounce btn_down_debounce (
+      .clk(clk),
+      .rst_n(rst_n),
+      .button(ui_in[1]),
+      .debounced(btn_down_in)
+  );
+
+  button_debounce btn_left_debounce (
+      .clk(clk),
+      .rst_n(rst_n),
+      .button(ui_in[2]),
+      .debounced(btn_left_in)
+  );
+
+  button_debounce btn_right_debounce (
+      .clk(clk),
+      .rst_n(rst_n),
+      .button(ui_in[3]),
+      .debounced(btn_right_in)
+  );
+
+  // Gamepad Pmod support
+  wire gamepad_pmod_latch = ui_in[4];
+  wire gamepad_pmod_clk = ui_in[5];
+  wire gamepad_pmod_data = ui_in[6];
+  wire gamepad_is_present;
+  wire gamepad_left;
+  wire gamepad_right;
+  wire gamepad_up;
+  wire gamepad_down;
+  wire gamepad_start;
+  wire gamepad_select;
+  wire gamepad_a;
+  wire gamepad_b;
+  wire gamepad_x;
+  wire gamepad_y;
+
+  /* verilator lint_off PINMISSING */
+  gamepad_pmod_single gamepad_pmod (
+      // Inputs:
+      .clk(clk),
+      .rst_n(rst_n),
+      .pmod_latch(gamepad_pmod_latch),
+      .pmod_clk(gamepad_pmod_clk),
+      .pmod_data(gamepad_pmod_data),
+
+      // Outputs:
+      .is_present(gamepad_is_present),
+      .left(gamepad_left),
+      .right(gamepad_right),
+      .up(gamepad_up),
+      .down(gamepad_down),
+      .start(gamepad_start),
+      .select(gamepad_select),
+      .a(gamepad_a),
+      .b(gamepad_b),
+      .x(gamepad_x),
+      .y(gamepad_y)
+  );
+  /* verilator lint_on PINMISSING */
+
+  // Combined inputs (d-pad + face buttons: X=up, B=down, Y=left, A=right)
+  wire btn_up = btn_up_in || gamepad_up || gamepad_x;
+  wire btn_down = btn_down_in || gamepad_down || gamepad_b;
+  wire btn_left = btn_left_in || gamepad_left || gamepad_y;
+  wire btn_right = btn_right_in || gamepad_right || gamepad_a;
+  reg btn_select_prev;
+  wire btn_select = gamepad_select;
+
+  // VGA signals
+  wire hsync;
+  wire vsync;
+  reg [1:0] R;
+  reg [1:0] G;
+  reg [1:0] B;
+  wire video_active;
+  wire [9:0] pix_x;
+  wire [9:0] pix_y;
+
+  // TinyVGA Pmod
+  assign uo_out = {hsync, B[0], G[0], R[0], vsync, B[1], G[1], R[1]};
+
+  wire [31:0] lfsr_out;
+
+  // Suppress unused signals warning
+  wire _unused_ok = &{ena, ui_in[6:4], lfsr_out[27:16], gamepad_is_present};
+
+  // Animation controller
+  wire animating;
+  wire [1:0] anim_dir;
+  wire [5:0] anim_offset;
+  wire anim_done;
+
+  anim_controller anim_controller_inst (
+      .clk(clk),
+      .rst_n(rst_n),
+      .vsync_rising_edge(vsync_rising_edge),
+      .btn_up(btn_up),
+      .btn_down(btn_down),
+      .btn_left(btn_left),
+      .btn_right(btn_right),
+      .enable(!show_welcome_screen),
+      .grid(grid),
+      .next_grid(next_grid),
+      .animating(animating),
+      .anim_dir(anim_dir),
+      .anim_offset(anim_offset),
+      .anim_done(anim_done)
+  );
+
+  wire [31:0] displacement_map;
+
+  vga_sync_generator vga_sync_gen (
+      .clk(clk),
+      .reset(~rst_n),
+      .hsync(hsync),
+      .vsync(vsync),
+      .display_on(video_active),
+      .hpos(pix_x),
+      .vpos(pix_y)
+  );
+
+  reg [63:0] grid;
+  wire [63:0] next_grid;
+  wire [63:0] welcome_screen_grid;
+  reg show_welcome_screen;
+
+  wire [3:0] last_added_tile_index;
+  reg [15:0] new_tiles;
+  reg [4:0] new_tiles_counter;
+
+  reg vsync_prev;
+  wire vsync_rising_edge = vsync && ~vsync_prev;
+
+  galois_lfsr lfsr_inst (
+      .clk  (clk),
+      .rst_n(rst_n),
+      .lfsr (lfsr_out)
+  );
+
+  reg retro_colors;
+  wire [5:0] rrggbb;
+  wire [9:0] pix_x_ahead = pix_x + 10'd1;
+  draw_game draw_game_inst (
+      .clk(clk),
+      .grid(grid),
+      .new_tiles(new_tiles),
+      .new_tiles_counter(new_tiles_counter[3:1]),
+      .retro_colors(retro_colors_in || retro_colors),
+      .debug_mode(debug_en),
+      .anim_active(animating),
+      .anim_dir(anim_dir),
+      .anim_offset(anim_offset),
+      .disp_map(displacement_map),
+      .x(pix_x_ahead),
+      .y(pix_y),
+      .rrggbb(rrggbb)
+  );
+
+  welcome_screen welcome_screen_inst (
+      .clk(clk),
+      .rst_n(rst_n),
+      .vsync_rising_edge(vsync_rising_edge),
+      .lfsr_out(lfsr_out[31:28]),
+      .grid(welcome_screen_grid)
+  );
+
+  wire [3:0] debug_move;
+  wire debug_btn_up = debug_move[0];
+  wire debug_btn_down = debug_move[1];
+  wire debug_btn_left = debug_move[2];
+  wire debug_btn_right = debug_move[3];
+
+  wire debug_grid_valid;
+  wire [3:0] debug_grid_addr;
+  wire [3:0] debug_grid_data;
+
+  game_logic game_logic_inst (
+      .clk(clk),
+      .rst_n(rst_n),
+      .grid(next_grid),
+      .added_tile_index(last_added_tile_index),
+      .displacement_map(displacement_map),
+      .lfsr_value(lfsr_out[15:0]),
+      .btn_up((~show_welcome_screen && ~animating && btn_up) | debug_btn_up),
+      .btn_right((~show_welcome_screen && ~animating && btn_right) | debug_btn_right),
+      .btn_down((~show_welcome_screen && ~animating && btn_down) | debug_btn_down),
+      .btn_left((~show_welcome_screen && ~animating && btn_left) | debug_btn_left),
+      .btn_start(~show_welcome_screen && gamepad_start),
+      .debug_move(|{debug_move}),
+      .debug_grid_valid(debug_grid_valid),
+      .debug_grid_addr(debug_grid_addr),
+      .debug_grid_data(debug_grid_data)
+  );
+
+  debug_controller debug_controller_inst (
+      .clk(clk),
+      .rst_n(rst_n),
+      .debug_en(debug_en),
+      .uio_in(uio_in),
+      .uio_out(uio_out),
+      .uio_oe(uio_oe),
+      .grid_in(next_grid),
+      .grid_out_valid(debug_grid_valid),
+      .grid_out_addr(debug_grid_addr),
+      .grid_out_data(debug_grid_data),
+      .force_move(debug_move)
+  );
+
+
+  always @(posedge clk) begin
+    if (~rst_n) begin
+      R <= 0;
+      G <= 0;
+      B <= 0;
+      vsync_prev <= 0;
+      show_welcome_screen <= 1'b1;
+      grid <= 0;
+      retro_colors <= 0;
+      btn_select_prev <= 0;
+      new_tiles <= 0;
+      new_tiles_counter <= 0;
+    end else begin
+      R <= video_active ? rrggbb[5:4] : 2'b00;
+      G <= video_active ? rrggbb[3:2] : 2'b00;
+      B <= video_active ? rrggbb[1:0] : 2'b00;
+      btn_select_prev <= btn_select;
+      vsync_prev <= vsync;
+
+      if (last_added_tile_index != 0) begin
+        new_tiles <= (16'd1 << last_added_tile_index);
+        new_tiles_counter <= 25;
+      end
+
+      if (vsync_rising_edge) begin
+        if (show_welcome_screen) begin
+          grid <= welcome_screen_grid;
+          if (btn_up || btn_down || btn_left || btn_right || gamepad_start) begin
+            show_welcome_screen <= 0;
+          end
+        end else if (anim_done) begin
+          grid <= next_grid;
+          new_tiles_counter <= 25;
+        end else if (!animating) begin
+          grid <= next_grid;
+        end
+
+        if (!anim_done) begin
+          if (new_tiles_counter != 0) begin
+            new_tiles_counter <= new_tiles_counter - 1;
+          end else begin
+            new_tiles <= 0;
+          end
+        end
+      end
+
+      if (btn_select && ~btn_select_prev) begin
+        retro_colors <= ~retro_colors;
+      end
+    end
+  end
 
 endmodule
